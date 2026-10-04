@@ -39,7 +39,7 @@ jobs:
         run: |
           latest_tag="$(curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-max-time 30 \
             "https://hub.docker.com/v2/repositories/chris230291/tvheadend/tags?page_size=2" \
-            | jq -r '[.results[].name | select(. != "latest")][0] // "')"
+            | jq -r '[.results[].name | select(. != "latest")][0] // empty')"
           echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
           echo "Latest published source tag: ${latest_tag:-none}"
 
