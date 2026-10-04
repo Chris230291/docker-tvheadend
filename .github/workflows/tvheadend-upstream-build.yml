@@ -1,0 +1,169 @@
+name: Tvheadend upstream build
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if the upstream commit has not changed
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tvheadend-upstream-build
+  cancel-in-progress: false
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.upstream.outputs.commit }}
+      update: ${{ steps.compare.outputs.update }}
+    steps:
+      - name: Resolve Tvheadend upstream commit
+        id: upstream
+        shell: bash
+        run: |
+          commit="$(curl --fail --silent --show-error https://api.github.com/repos/tvheadend/tvheadend/commits/master | jq -er '.sha')"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Upstream Tvheadend commit: $commit"
+
+      - name: Get latest Docker Hub tag
+        id: latest_tag
+        shell: bash
+        run: |
+          latest_tag="$(curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-max-time 30 \
+            "https://hub.docker.com/v2/repositories/chris230291/tvheadend/tags?page_size=2" \
+            | jq -r '[.results[].name | select(. != "latest")][0] // "')"
+          echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "Latest published source tag: ${latest_tag:-none}"
+
+      - name: Compare upstream commit and Docker Hub tag
+        id: compare
+        env:
+          UPSTREAM_COMMIT: ${{ steps.upstream.outputs.commit }}
+          LATEST_TAG: ${{ steps.latest_tag.outputs.tag }}
+          FORCE_BUILD: ${{ inputs.force || false }}
+        shell: bash
+        run: |
+          if [[ "$FORCE_BUILD" == "true" || "$UPSTREAM_COMMIT" != "$LATEST_TAG" ]]; then
+            echo "update=true" >> "$GITHUB_OUTPUT"
+            echo "Update detected (Docker Hub: ${LATEST_TAG:-none}, upstream: $UPSTREAM_COMMIT)."
+          else
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            echo "No update detected."
+          fi
+
+  build:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.update == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            dockerfile: Dockerfile
+          - arch: arm64
+            platform: linux/arm64
+            dockerfile: Dockerfile.aarch64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      - name: Set build metadata
+        id: metadata
+        shell: bash
+        run: echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push architecture image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=chris230291/tvheadend,push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            TVHEADEND_COMMIT=${{ needs.check-upstream.outputs.commit }}
+            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
+            VERSION=${{ needs.check-upstream.outputs.commit }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-manifest:
+    needs: [check-upstream, build]
+    if: needs.check-upstream.outputs.update == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      - name: Publish multi-arch tags
+        env:
+          IMAGE: chris230291/tvheadend
+          COMMIT: ${{ needs.check-upstream.outputs.commit }}
+        shell: bash
+        run: |
+          digests=("$RUNNER_TEMP"/digests/*)
+          if [[ ${#digests[@]} -ne 2 ]]; then
+            echo "Expected two architecture image digests, found ${#digests[@]}." >&2
+            exit 1
+          fi
+
+          sources=()
+          for digest_file in "${digests[@]}"; do
+            sources+=("$IMAGE@sha256:$(basename "$digest_file")")
+          done
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" \
+            --tag "$IMAGE:$COMMIT" \
+            "${sources[@]}"
